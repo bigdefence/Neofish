@@ -1,0 +1,482 @@
+<template>
+  <div class="main-view">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="brand" @click="router.push('/')">NEOFISH</div>
+      </div>
+      
+      <div class="header-center">
+        <div class="view-switcher">
+          <button 
+            v-for="mode in ['graph', 'split', 'workbench']" 
+            :key="mode"
+            class="switch-btn"
+            :class="{ active: viewMode === mode }"
+            @click="viewMode = mode"
+          >
+            {{ { graph: '그래프', split: '분할 화면', workbench: '워크벤치' }[mode] }}
+          </button>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="workflow-step">
+          <span class="step-num">Step 3/5</span>
+          <span class="step-name">시뮬레이션 시작</span>
+        </div>
+        <div class="step-divider"></div>
+        <span class="status-indicator" :class="statusClass">
+          <span class="dot"></span>
+          {{ statusText }}
+        </span>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="content-area">
+      <!-- Left Panel: Graph -->
+      <div class="panel-wrapper left" :style="leftPanelStyle">
+        <GraphPanel 
+          :graphData="graphData"
+          :loading="graphLoading"
+          :currentPhase="3"
+          :isSimulating="isSimulating"
+          @refresh="refreshGraph"
+          @toggle-maximize="toggleMaximize('graph')"
+        />
+      </div>
+
+      <!-- Right Panel: Step3 시뮬레이션 시작 -->
+      <div class="panel-wrapper right" :style="rightPanelStyle">
+        <Step3Simulation
+          :simulationId="currentSimulationId"
+          :maxRounds="maxRounds"
+          :minutesPerRound="minutesPerRound"
+          :projectData="projectData"
+          :graphData="graphData"
+          :systemLogs="systemLogs"
+          @go-back="handleGoBack"
+          @next-step="handleNextStep"
+          @add-log="addLog"
+          @update-status="updateStatus"
+        />
+      </div>
+    </main>
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import GraphPanel from '../components/GraphPanel.vue'
+import Step3Simulation from '../components/Step3Simulation.vue'
+import { getProject, getGraphData } from '../api/graph'
+import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+
+const route = useRoute()
+const router = useRouter()
+
+// Props
+const props = defineProps({
+  simulationId: String
+})
+
+// Layout State
+const viewMode = ref('split')
+
+// Data State
+const currentSimulationId = ref(route.params.simulationId)
+// 초기화 시 query에서 maxRounds를 바로 읽어 자식 컴포넌트에 즉시 전달
+const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
+const minutesPerRound = ref(30) // 기본값: 라운드당 30분
+const projectData = ref(null)
+const graphData = ref(null)
+const graphLoading = ref(false)
+const systemLogs = ref([])
+const currentStatus = ref('processing') // processing | completed | error
+
+// --- Computed Layout Styles ---
+const leftPanelStyle = computed(() => {
+  if (viewMode.value === 'graph') return { width: '100%', opacity: 1, transform: 'translateX(0)' }
+  if (viewMode.value === 'workbench') return { width: '0%', opacity: 0, transform: 'translateX(-20px)' }
+  return { width: '50%', opacity: 1, transform: 'translateX(0)' }
+})
+
+const rightPanelStyle = computed(() => {
+  if (viewMode.value === 'workbench') return { width: '100%', opacity: 1, transform: 'translateX(0)' }
+  if (viewMode.value === 'graph') return { width: '0%', opacity: 0, transform: 'translateX(20px)' }
+  return { width: '50%', opacity: 1, transform: 'translateX(0)' }
+})
+
+// --- Status Computed ---
+const statusClass = computed(() => {
+  return currentStatus.value
+})
+
+const statusText = computed(() => {
+  if (currentStatus.value === 'error') return 'Error'
+  if (currentStatus.value === 'completed') return 'Completed'
+  return 'Running'
+})
+
+const isSimulating = computed(() => currentStatus.value === 'processing')
+
+// --- Helpers ---
+const addLog = (msg) => {
+  const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) + '.' + new Date().getMilliseconds().toString().padStart(3, '0')
+  systemLogs.value.push({ time, msg })
+  if (systemLogs.value.length > 200) {
+    systemLogs.value.shift()
+  }
+}
+
+const updateStatus = (status) => {
+  currentStatus.value = status
+}
+
+// --- Layout Methods ---
+const toggleMaximize = (target) => {
+  if (viewMode.value === target) {
+    viewMode.value = 'split'
+  } else {
+    viewMode.value = target
+  }
+}
+
+const handleGoBack = async () => {
+  // Step 2로 돌아가기 전에 실행 중인 시뮬레이션을 먼저 종료
+  addLog('Step 2로 돌아가기 전에 시뮬레이션 종료를 시도합니다...')
+  
+  // 폴링 중지
+  stopGraphRefresh()
+  
+  try {
+    // 먼저 정상 종료 시도
+    const envStatusRes = await getEnvStatus({ simulation_id: currentSimulationId.value })
+    
+    if (envStatusRes.success && envStatusRes.data?.env_alive) {
+      addLog('시뮬레이션 환경을 종료하는 중...')
+      try {
+        await closeSimulationEnv({ 
+          simulation_id: currentSimulationId.value,
+          timeout: 10
+        })
+          addLog('✓ 시뮬레이션 환경이 정상 종료되었습니다.')
+      } catch (closeErr) {
+          addLog('시뮬레이션 환경 종료 실패, 강제 중지를 시도합니다...')
+        try {
+          await stopSimulation({ simulation_id: currentSimulationId.value })
+            addLog('✓ 시뮬레이션이 강제로 중지되었습니다.')
+        } catch (stopErr) {
+            addLog(`강제 중지 실패: ${stopErr.message}`)
+        }
+      }
+    } else {
+      // 환경이 꺼져 있어도 프로세스 중지가 필요한지 확인
+      if (isSimulating.value) {
+        addLog('시뮬레이션 프로세스를 중지하는 중...')
+        try {
+          await stopSimulation({ simulation_id: currentSimulationId.value })
+          addLog('✓ 시뮬레이션이 중지되었습니다.')
+        } catch (err) {
+          addLog(`시뮬레이션 중지 실패: ${err.message}`)
+        }
+      }
+    }
+  } catch (err) {
+    addLog(`시뮬레이션 상태 확인 실패: ${err.message}`)
+  }
+  
+  // Step 2(환경 구성)으로 이동
+  router.push({ name: 'Simulation', params: { simulationId: currentSimulationId.value } })
+}
+
+const handleNextStep = () => {
+  // Step3Simulation 컴포넌트가 보고서 생성 및 라우팅을 직접 처리함
+  // 이 메서드는 백업 용도
+  addLog('Step 4로 이동: 보고서 생성')
+}
+
+// --- Data Logic ---
+const loadSimulationData = async () => {
+  try {
+    addLog(`시뮬레이션 데이터 불러오는 중: ${currentSimulationId.value}`)
+    
+    // simulation 정보 조회
+    const simRes = await getSimulation(currentSimulationId.value)
+    if (simRes.success && simRes.data) {
+      const simData = simRes.data
+      
+      // simulation config에서 minutes_per_round 조회
+      try {
+        const configRes = await getSimulationConfig(currentSimulationId.value)
+        if (configRes.success && configRes.data?.time_config?.minutes_per_round) {
+          minutesPerRound.value = configRes.data.time_config.minutes_per_round
+          addLog(`시간 설정: 라운드당 ${minutesPerRound.value}분`)
+        }
+      } catch (configErr) {
+        addLog(`시간 설정 조회 실패, 기본값 사용: ${minutesPerRound.value}분/라운드`)
+      }
+      
+      // project 정보 조회
+      if (simData.project_id) {
+        const projRes = await getProject(simData.project_id)
+        if (projRes.success && projRes.data) {
+          projectData.value = projRes.data
+          addLog(`프로젝트 로드 완료: ${projRes.data.project_id}`)
+          
+          // graph 데이터 조회
+          if (projRes.data.graph_id) {
+            await loadGraph(projRes.data.graph_id)
+          }
+        }
+      }
+    } else {
+      addLog(`시뮬레이션 데이터 로드 실패: ${simRes.error || '알 수 없는 오류'}`)
+    }
+  } catch (err) {
+    addLog(`로드 중 예외 발생: ${err.message}`)
+  }
+}
+
+const loadGraph = async (graphId) => {
+  // 시뮬레이션 진행 중 자동 새로고침에서는 전체 로딩을 숨겨 깜빡임을 줄임
+  // 수동 새로고침/초기 로딩에서는 로딩 표시
+  if (!isSimulating.value) {
+    graphLoading.value = true
+  }
+  
+  try {
+    const res = await getGraphData(graphId)
+    if (res.success) {
+      graphData.value = res.data
+      if (!isSimulating.value) {
+        addLog('그래프 데이터 로드 완료')
+      }
+    }
+  } catch (err) {
+    addLog(`그래프 로드 실패: ${err.message}`)
+  } finally {
+    graphLoading.value = false
+  }
+}
+
+const refreshGraph = () => {
+  if (typeof document !== 'undefined' && document.hidden) {
+    return
+  }
+  if (projectData.value?.graph_id) {
+    loadGraph(projectData.value.graph_id)
+  }
+}
+
+// --- Auto Refresh Logic ---
+let graphRefreshTimer = null
+
+const startGraphRefresh = () => {
+  if (graphRefreshTimer) return
+  addLog('그래프 실시간 새로고침 시작 (30초)')
+  // 즉시 1회 실행 후 30초 간격 반복
+  graphRefreshTimer = setInterval(refreshGraph, 30000)
+}
+
+const stopGraphRefresh = () => {
+  if (graphRefreshTimer) {
+    clearInterval(graphRefreshTimer)
+    graphRefreshTimer = null
+    addLog('그래프 실시간 새로고침 중지')
+  }
+}
+
+watch(isSimulating, (newValue) => {
+  if (newValue) {
+    startGraphRefresh()
+  } else {
+    stopGraphRefresh()
+  }
+}, { immediate: true })
+
+onMounted(() => {
+  addLog('SimulationRunView 초기화')
+  
+  // maxRounds 설정 기록(초기화 시 query에서 이미 가져옴)
+  if (maxRounds.value) {
+    addLog(`사용자 지정 시뮬레이션 라운드: ${maxRounds.value}`)
+  }
+  
+  loadSimulationData()
+})
+
+onUnmounted(() => {
+  stopGraphRefresh()
+})
+</script>
+
+<style scoped>
+.main-view {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+  overflow: hidden;
+}
+
+/* Header */
+.app-header {
+  height: 60px;
+  border-bottom: 1px solid var(--glass-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  background: var(--card);
+  backdrop-filter: blur(10px);
+  z-index: 100;
+  position: relative;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+}
+
+.brand {
+  font-family: var(--font-heading);
+  font-weight: 800;
+  font-size: 18px;
+  letter-spacing: 2px;
+  cursor: pointer;
+  color: var(--foreground);
+  text-transform: uppercase;
+  transition: all 0.3s ease;
+}
+
+.brand:hover {
+  text-shadow: var(--accent-glow);
+  color: #fff;
+}
+
+.header-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.view-switcher {
+  display: flex;
+  background: rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  border-radius: 4px;
+  gap: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.switch-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 6px 16px;
+  font-size: 12px;
+  font-family: var(--font-accent);
+  color: var(--text-muted);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.switch-btn:hover {
+  color: var(--foreground);
+}
+
+.switch-btn.active {
+  background: rgba(0, 240, 255, 0.1);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  box-shadow: var(--glass-glow);
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.workflow-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-family: var(--font-accent);
+}
+
+.step-num {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.step-name {
+  color: var(--foreground);
+  text-transform: uppercase;
+}
+
+.step-divider {
+  width: 1px;
+  height: 14px;
+  background-color: var(--glass-border);
+}
+
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-accent);
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.status-indicator.processing .dot { 
+  background: var(--warning); 
+  box-shadow: 0 0 10px var(--warning);
+  animation: pulse 1s infinite alternate; 
+}
+.status-indicator.completed .dot { 
+  background: var(--accent); 
+  box-shadow: 0 0 10px var(--accent);
+}
+.status-indicator.error .dot { 
+  background: #ff0055; 
+  box-shadow: 0 0 10px #ff0055;
+}
+
+@keyframes pulse { 
+  from { opacity: 0.4; box-shadow: 0 0 2px var(--warning); }
+  to { opacity: 1; box-shadow: 0 0 12px var(--warning); }
+}
+
+/* Content */
+.content-area {
+  flex: 1;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+  background: transparent;
+}
+
+.panel-wrapper {
+  height: 100%;
+  overflow: hidden;
+  transition: width 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.3s ease, transform 0.3s ease;
+  will-change: width, opacity, transform;
+}
+
+.panel-wrapper.left {
+  border-right: 1px solid var(--glass-border);
+}
+</style>
